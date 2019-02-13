@@ -34,22 +34,27 @@
 
 #include "fmacros.h"
 #include <sys/types.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <string.h>
+#include <errno.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <limits.h>
+#include <stdlib.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <wspiapi.h>
+#else
+#include <netdb.h>
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <sys/un.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <string.h>
-#include <netdb.h>
-#include <errno.h>
-#include <stdarg.h>
-#include <stdio.h>
 #include <poll.h>
-#include <limits.h>
-#include <stdlib.h>
+#endif
 
 #include "net.h"
 #include "sds.h"
@@ -57,12 +62,61 @@
 /* Defined in hiredis.c */
 void __redisSetError(redisContext *c, int type, const char *str);
 
+#ifdef HAVE_LIBSSH2
+ssize_t read_socket(redisContext *c) {
+  unsigned char buffer[4 * 1024];
+  ssize_t r = c->connection_method & SSH_CONNECTION ? libssh2_channel_read(c->channel, buffer, sizeof(buffer)) : crossplatform_read(c->fd, buffer, sizeof(buffer));
+  if (r == 0) {
+    return 0;
+  }
+
+  inject_ssl(c->ssl, buffer, r);
+  return 1;
+}
+
+ssize_t write_socket(redisContext *c) {
+  unsigned char buffer[4 * 1024];
+  int r = extract_ssl(c->ssl, buffer, sizeof(buffer));
+  int wr = c->connection_method & SSH_CONNECTION ? libssh2_channel_write(c->channel, buffer, r) : crossplatform_write(c->fd, buffer, r);
+  if (wr != r) {
+    return 0;
+  }
+
+  return 1;
+}
+#endif
+
 static void redisContextCloseFd(redisContext *c) {
     if (c && c->fd >= 0) {
+#ifdef _WIN32
+        closesocket(c->fd);
+#else
         close(c->fd);
+#endif
         c->fd = -1;
     }
 }
+
+#ifdef _WIN32
+int strerror_r(int err, char *text, int size) {
+    #define UPREFIX "Unknown error: %u"
+    unsigned int errnum = err;
+    int retval = 0;
+    size_t slen = 0;
+    if (errnum < (unsigned int) sys_nerr) {
+        memcpy(text, sys_errlist[errnum], size);
+        slen = strlen(text);
+    } else {
+        slen = snprintf(text, size, UPREFIX, errnum);
+        retval = EINVAL;
+    }
+
+    if (slen >= size)
+        retval = ERANGE;
+
+    return retval;
+}
+#endif
 
 static void __redisSetErrorFromErrno(redisContext *c, int type, const char *prefix) {
     int errorno = errno;  /* snprintf() may change errno */
@@ -101,6 +155,15 @@ static int redisCreateSocket(redisContext *c, int type) {
 }
 
 static int redisSetBlocking(redisContext *c, int blocking) {
+#ifdef _WIN32
+    unsigned long flags = blocking;
+    int res = ioctlsocket(c->fd, FIONBIO, &flags);
+    if (res == SOCKET_ERROR) {
+        __redisSetErrorFromErrno(c,REDIS_ERR_IO,"ioctlsocket(FIONBIO)");
+        redisContextCloseFd(c);
+        return REDIS_ERR;
+    }
+#else
     int flags;
 
     /* Set the socket nonblocking.
@@ -122,6 +185,7 @@ static int redisSetBlocking(redisContext *c, int blocking) {
         redisContextCloseFd(c);
         return REDIS_ERR;
     }
+#endif
     return REDIS_OK;
 }
 
@@ -202,6 +266,40 @@ static int redisContextTimeoutMsec(redisContext *c, long *result)
 }
 
 static int redisContextWaitReady(redisContext *c, long msec) {
+#ifdef _WIN32
+    fd_set master_set;
+    FD_ZERO(&master_set);
+    int max_sd = c->fd;
+    FD_SET(c->fd, &master_set);
+
+    struct timeval tv;
+    tv.tv_sec = msec/1000;
+    tv.tv_usec = (msec % 1000) * 1000;
+
+    if (errno == EINPROGRESS) {
+        int res;
+
+        if ((res = select(max_sd + 1, &master_set, NULL, NULL, &tv)) == -1) {
+            __redisSetErrorFromErrno(c, REDIS_ERR_IO, "select(2)");
+            redisContextCloseFd(c);
+            return REDIS_ERR;
+        } else if (res == 0) {
+            errno = ETIMEDOUT;
+            __redisSetErrorFromErrno(c,REDIS_ERR_IO,NULL);
+            redisContextCloseFd(c);
+            return REDIS_ERR;
+        }
+
+        if (redisCheckSocketError(c) != REDIS_OK)
+            return REDIS_ERR;
+
+        return REDIS_OK;
+    }
+
+    __redisSetErrorFromErrno(c,REDIS_ERR_IO,NULL);
+    redisContextCloseFd(c);
+    return REDIS_ERR;
+#else
     struct pollfd   wfd[1];
 
     wfd[0].fd     = c->fd;
@@ -232,6 +330,7 @@ static int redisContextWaitReady(redisContext *c, long msec) {
     __redisSetErrorFromErrno(c,REDIS_ERR_IO,NULL);
     redisContextCloseFd(c);
     return REDIS_ERR;
+#endif
 }
 
 int redisCheckConnectDone(redisContext *c, int *completed) {
@@ -291,6 +390,72 @@ int redisContextSetTimeout(redisContext *c, const struct timeval tv) {
 static int _redisContextConnectTcp(redisContext *c, const char *addr, int port,
                                    const struct timeval *timeout,
                                    const char *source_addr) {
+#ifdef HAVE_LIBSSH2
+    if (c->connection_method & SSH_CONNECTION) {
+      if (!(c->channel = libssh2_channel_direct_tcpip(c->session, addr, port))) {
+        __redisSetError(c, REDIS_ERR_OTHER, "Unable to open a direct ssh tunnel");
+        return REDIS_ERR;
+      }
+
+      if (!(c->connection_method & SSL_CONNECTION)) {
+        c->flags |= REDIS_CONNECTED;
+        return REDIS_OK;
+      }
+    }
+
+    if (c->connection_method & SSL_CONNECTION) {
+      int socket = c->fd;
+      fd_set read_fds, write_fds;
+      int n_fds = FD_SETSIZE;
+      BIO* biow = SSL_get_wbio(c->ssl);
+
+      for (;;) {
+        FD_ZERO(&read_fds);
+        FD_ZERO(&write_fds);
+
+        if (SSL_in_init(c->ssl)) {
+          SSL_do_handshake(c->ssl);
+        }
+
+        if (SSL_is_init_finished(c->ssl)) {
+          break;
+        }
+
+        FD_SET(socket, &read_fds);
+        if (BIO_pending(biow)) {
+          FD_SET(socket, &write_fds);
+        }
+
+        switch (select(n_fds, &read_fds, &write_fds, 0, 0)) {
+          case -1: /* trouble */
+            if (errno != EINTR) {
+              __redisSetError(c, REDIS_ERR_OTHER, "Error: Could not build a SSL session");
+              return REDIS_ERR;
+            }
+            break;
+          case 0: /* time out */
+            break;
+          default: /* event */
+            if (FD_ISSET(socket, &read_fds)) {
+              if (!read_socket(c)) {
+                __redisSetError(c, REDIS_ERR_OTHER, "Error: Could not build a SSL session");
+                return REDIS_ERR;
+              }
+            }
+            if (FD_ISSET(socket, &write_fds)) {
+              if (!write_socket(c)) {
+                __redisSetError(c, REDIS_ERR_OTHER, "Error: Could not build a SSL session");
+                return REDIS_ERR;
+              }
+            }
+            break;
+        }
+      }
+      c->flags |= REDIS_CONNECTED;
+      return REDIS_OK;
+    }
+#endif
+
     int s, rv, n;
     char _port[6];  /* strlen("65535"); */
     struct addrinfo hints, *servinfo, *bservinfo, *p, *b;
@@ -471,6 +636,9 @@ int redisContextConnectBindTcp(redisContext *c, const char *addr, int port,
 }
 
 int redisContextConnectUnix(redisContext *c, const char *path, const struct timeval *timeout) {
+#ifdef _WIN32
+    return REDIS_ERR;
+#else
     int blocking = (c->flags & REDIS_BLOCK);
     struct sockaddr_un *sa;
     long timeout_msec = -1;
@@ -518,4 +686,5 @@ int redisContextConnectUnix(redisContext *c, const char *path, const struct time
 
     c->flags |= REDIS_CONNECTED;
     return REDIS_OK;
+#endif
 }
