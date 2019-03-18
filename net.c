@@ -404,51 +404,59 @@ static int _redisContextConnectTcp(redisContext *c, const char *addr, int port,
     }
 
     if (c->connection_method & SSL_CONNECTION) {
-      int socket = c->fd;
-      fd_set read_fds, write_fds;
-      int n_fds = FD_SETSIZE;
-      BIO* biow = SSL_get_wbio(c->ssl);
+      if (c->connection_method & SSH_CONNECTION) {
+        int socket = c->fd;
+        fd_set read_fds, write_fds;
+        int n_fds = FD_SETSIZE;
+        BIO* biow = SSL_get_wbio(c->ssl);
 
-      for (;;) {
-        FD_ZERO(&read_fds);
-        FD_ZERO(&write_fds);
+        for (;;) {
+          FD_ZERO(&read_fds);
+          FD_ZERO(&write_fds);
 
-        if (SSL_in_init(c->ssl)) {
-          SSL_do_handshake(c->ssl);
-        }
+          if (SSL_in_init(c->ssl)) {
+            SSL_do_handshake(c->ssl);
+          }
 
-        if (SSL_is_init_finished(c->ssl)) {
-          break;
-        }
-
-        FD_SET(socket, &read_fds);
-        if (BIO_pending(biow)) {
-          FD_SET(socket, &write_fds);
-        }
-
-        switch (select(n_fds, &read_fds, &write_fds, 0, 0)) {
-          case -1: /* trouble */
-            if (errno != EINTR) {
-              __redisSetError(c, REDIS_ERR_OTHER, "Error: Could not build a SSL session");
-              return REDIS_ERR;
-            }
+          if (SSL_is_init_finished(c->ssl)) {
             break;
-          case 0: /* time out */
-            break;
-          default: /* event */
-            if (FD_ISSET(socket, &read_fds)) {
-              if (!read_socket(c)) {
+          }
+
+          FD_SET(socket, &read_fds);
+          if (BIO_pending(biow)) {
+            FD_SET(socket, &write_fds);
+          }
+
+          switch (select(n_fds, &read_fds, &write_fds, 0, 0)) {
+            case -1: /* trouble */
+              if (errno != EINTR) {
                 __redisSetError(c, REDIS_ERR_OTHER, "Error: Could not build a SSL session");
                 return REDIS_ERR;
               }
-            }
-            if (FD_ISSET(socket, &write_fds)) {
-              if (!write_socket(c)) {
-                __redisSetError(c, REDIS_ERR_OTHER, "Error: Could not build a SSL session");
-                return REDIS_ERR;
+              break;
+            case 0: /* time out */
+              break;
+            default: /* event */
+              if (FD_ISSET(socket, &read_fds)) {
+                if (!read_socket(c)) {
+                  __redisSetError(c, REDIS_ERR_OTHER, "Error: Could not build a SSL session");
+                  return REDIS_ERR;
+                }
               }
-            }
-            break;
+              if (FD_ISSET(socket, &write_fds)) {
+                if (!write_socket(c)) {
+                  __redisSetError(c, REDIS_ERR_OTHER, "Error: Could not build a SSL session");
+                  return REDIS_ERR;
+                }
+              }
+              break;
+          }
+        }
+      } else {
+        int r = SSL_connect(c->ssl);
+        if (r < 0) {
+          __redisSetError(c, REDIS_ERR_OTHER, "Error: Could not build a SSL session");
+          return REDIS_ERR;
         }
       }
       c->flags |= REDIS_CONNECTED;

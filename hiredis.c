@@ -156,7 +156,11 @@ static ssize_t raw_write(redisContext *c, const void *buffer, size_t length) {
   ssize_t nwrite = -1;
 #ifdef HAVE_LIBSSH2
   if (c->connection_method & SSL_CONNECTION) {
-    nwrite = ssl_write(c, buffer, length);
+    if (c->connection_method & SSH_CONNECTION) {
+      nwrite = ssl_write(c, buffer, length);
+    } else {
+      nwrite = SSL_write(c->ssl, buffer, length);
+    }
   } else {
 #endif
     nwrite = crossplatform_write(c->fd, buffer, length);
@@ -170,7 +174,11 @@ static ssize_t raw_read(redisContext *c, void *buffer, size_t length) {
   ssize_t nread = -1;
 #ifdef HAVE_LIBSSH2
   if (c->connection_method & SSL_CONNECTION) {
-    nread = ssl_read(c, buffer, length);
+    if (c->connection_method & SSH_CONNECTION) {
+      nread = ssl_read(c, buffer, length);
+    } else {
+      nread = SSL_read(c->ssl, buffer, length);
+    }
   } else {
 #endif
     nread = crossplatform_read(c->fd, buffer, length);
@@ -1002,10 +1010,15 @@ redisContext *redisConnectSSH(const char *host, int port, const char *ssh_addres
     SSL_CTX_set_info_callback(ssl_ctx, ssl_info_callback);
 #endif
     c->fd = server_sock;
-    BIO *bior = BIO_new(BIO_s_mem());
-    BIO *biow = BIO_new(BIO_s_mem());
-    SSL_set_bio(ssl, bior, biow);
-    SSL_set_connect_state(ssl);
+    if (c->connection_method & SSH_CONNECTION) {
+      BIO *bior = BIO_new(BIO_s_mem());
+      BIO *biow = BIO_new(BIO_s_mem());
+      SSL_set_bio(ssl, bior, biow);
+      SSL_set_connect_state(ssl);
+    } else {
+      BIO *sbio = BIO_new_socket(c->fd, BIO_NOCLOSE);
+      SSL_set_bio(ssl, sbio, sbio);
+    }
   }
 
   c->ssl = ssl;
